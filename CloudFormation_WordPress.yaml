@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Production WordPress Instance with Monitoring'
+
+Parameters:
+  KeyName:
+    Description: EC2 Key Pair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: wordpress-project-key
+  
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+
+Resources:
+  # VPC Configuration
+  WordPressVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: WordPress-Production-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: WordPress-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref WordPressVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: WordPress-Public-Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+      Tags:
+        - Key: Name
+          Value: WordPress-Public-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group
+  WordPressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for WordPress instance
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: Allow SSH
+      Tags:
+        - Key: Name
+          Value: WordPress-SG
+
+  # IAM Role for CloudWatch
+  WordPressRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: WordPress-Role
+
+  WordPressInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WordPressRole
+
+  # EC2 Instance
+  WordPressInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref WordPressInstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref WordPressSecurityGroup
+          SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update system
+          yum update -y
+          
+          # Install Apache, PHP, MySQL
+          amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2
+          yum install -y httpd mariadb-server
+          
+          # Start services
+          systemctl start httpd
+          systemctl enable httpd
+          systemctl start mariadb
+          systemctl enable mariadb
+          
+          # Download WordPress
+          cd /var/www/html
+          wget https://wordpress.org/latest.tar.gz
+          tar -xzf latest.tar.gz
+          cp -r wordpress/* .
+          rm -rf wordpress latest.tar.gz
+          
+          # Set permissions
+          chown -R apache:apache /var/www/html
+          chmod -R 755 /var/www/html
+          
+          # Configure MySQL
+          mysql -e "CREATE DATABASE wordpress;"
+          mysql -e "CREATE USER 'wpuser'@'localhost' IDENTIFIED BY 'wppassword123';"
+          mysql -e "GRANT ALL PRIVILEGES ON wordpress.* TO 'wpuser'@'localhost';"
+          mysql -e "FLUSH PRIVILEGES;"
+          
+          # Configure WordPress
+          cp wp-config-sample.php wp-config.php
+          sed -i 's/database_name_here/wordpress/' wp-config.php
+          sed -i 's/username_here/wpuser/' wp-config.php
+          sed -i 's/password_here/wppassword123/' wp-config.php
+          
+          # Install CloudWatch agent
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U ./amazon-cloudwatch-agent.rpm
+          
+          # Create CloudWatch config
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
+          {
+            "metrics": {
+              "namespace": "WordPress/Production",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [{"name": "cpu_usage_idle", "rename": "CPU_IDLE", "unit": "Percent"}],
+                  "totalcpu": false
+                },
+                "disk": {
+                  "measurement": [{"name": "used_percent", "rename": "DISK_USED", "unit": "Percent"}],
+                  "resources": ["*"]
+                },
+                "mem": {
+                  "measurement": [{"name": "mem_used_percent", "rename": "MEM_USED", "unit": "Percent"}]
+                }
+              }
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/httpd/access_log",
+                      "log_group_name": "/wordpress/production/apache/access",
+                      "log_stream_name": "{instance_id}"
+                    },
+                    {
+                      "file_path": "/var/log/httpd/error_log",
+                      "log_group_name": "/wordpress/production/apache/error",
+                      "log_stream_name": "{instance_id}"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config \
+            -m ec2 \
+            -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+      Tags:
+        - Key: Name
+          Value: WordPress-Production-Instance
+        - Key: Environment
+          Value: Production
+
+Outputs:
+  WebsiteURL:
+    Description: WordPress Website URL
+    Value: !Sub 'http://${WordPressInstance.PublicIp}'
+  
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref WordPressInstance
+    Export:
+      Name: WordPress-Production-InstanceId
+  
+  PublicIP:
+    Description: Public IP Address
+    Value: !GetAtt WordPressInstance.PublicIp
